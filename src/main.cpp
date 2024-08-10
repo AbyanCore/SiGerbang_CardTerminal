@@ -11,15 +11,8 @@
 #include <Preferences.h>
 #include <esp32-hal-cpu.h>
 #include <Esp.h>
-
-// Define Wifi credentials
-const char WIFI_SSID[] PROGMEM  = "dev.insidertech.id"; // Wifi SSID
-const char WIFI_PASS[] PROGMEM  = "letmein1234";      // Wifi Password
-
-// Define WebSocket server
-#define WS_SERVER "192.168.88.10" // WebSocket server address
-#define WS_PORT   8080    // WebSocket server port
-#define WS_PATH   "/"     // WebSocket server path
+#include <DNSServer.h>
+#include <ESPAsyncWebServer.h>
 
 // Define the pins for the rc522 RFID reader
 #define SS_PIN  5   // ESP32 DevKit V1 pin GPIO5
@@ -41,6 +34,61 @@ TwoWire oledWire(0);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &oledWire, OLED_RESET);
 websockets::WebsocketsClient wsc;
 Preferences prefs;
+DNSServer dnsServer;
+AsyncWebServer wsr(80);
+
+// simple captive portal page for wifi configuration and websocket server configuration
+const char* captivePortalPage = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Configuration Page</title>
+</head>
+<body>
+    <h3>WiFi Configuration</h3>
+    <form action="/save-config" method="get">
+        <label for="ssid">SSID:</label><br>
+        <input type="text" id="ssid" name="ssid" required><br>
+        <label for="password">Password:</label><br>
+        <input type="password" id="password" name="password" required><br><br>
+
+        <h3>WebSocket Configuration</h3>
+        <label for="server">Server:</label><br>
+        <input type="text" id="server" name="server" required><br>
+        <label for="port">Port:</label><br>
+        <input type="text" id="port" name="port" required><br>
+        <label for="path">Path:</label><br>
+        <input type="text" id="path" name="path" required><br><br>
+
+        <h3>Configuration Key</h3>
+        <label for="path">Key:</label><br>
+        <input type="text" id="key" name="key" required><br><br>
+
+        <input type="submit" value="Save">
+    </form>
+</body>
+</html>
+)";
+
+JsonDocument makeResponse(String topic,String data,String to,String from = String(ESP.getEfuseMac()))
+{
+  JsonDocument res;
+  res["topic"] = topic;
+  res["from"] = from;
+  res["data"] = data;
+  res["to"] = to;
+  return res;
+}
+
+JsonDocument makeResponse(String topic,JsonDocument data,String to,String from = String(ESP.getEfuseMac()))
+{
+  JsonDocument res;
+  res["topic"] = topic;
+  res["from"] = from;
+  res["data"] = data;
+  res["to"] = to;
+  return res;
+}
 
 bool checkPeripherals()
 {
@@ -81,20 +129,15 @@ void turnlamp1s(void *parameter)
 
 void handleCardRead(MFRC522::Uid uid, MFRC522::PICC_Type piccType){
   xTaskCreatePinnedToCore(turnlamp1s, "turnlamp1s", 2048, NULL, 1, NULL, 0);
-  const String cardType = rfid.PICC_GetTypeName(piccType);
-  const String cardUid = String(uid.uidByte[0], HEX) + " " + String(uid.uidByte[1], HEX) + " " + String(uid.uidByte[2], HEX) + " " + String(uid.uidByte[3], HEX);
+  // const String cardType = rfid.PICC_GetTypeName(piccType);
+  // const String cardUid = String(uid.uidByte[0], HEX) + " " + String(uid.uidByte[1], HEX) + " " + String(uid.uidByte[2], HEX) + " " + String(uid.uidByte[3], HEX);
   JsonDocument data_doc;
-  data_doc["cardType"] = cardType;
-  data_doc["cardUid"] = cardUid;
-  JsonDocument res;
-  res["from"] = ESP.getEfuseMac();
-  res["data"] = data_doc.as<String>();
-  res["to"] = "all";
-
-  wsc.send(res.as<String>());
+  data_doc["cardType"] = rfid.PICC_GetTypeName(piccType);
+  data_doc["cardUid"] = String(uid.uidByte[0], HEX) + " " + String(uid.uidByte[1], HEX) + " " + String(uid.uidByte[2], HEX) + " " + String(uid.uidByte[3], HEX);
+  wsc.send(makeResponse("rfid_data",data_doc, "server").as<String>());
 
   // print card information to display
-  printToDisplay("Type: " + cardType + "\n" + "UID: " + cardUid);
+  printToDisplay("Type: " + data_doc["cardType"].as<String>() + "\n" + "UID: " + data_doc["cardUid"].as<String>());
 }
 
 void rcReader(std::function<void(MFRC522::Uid, MFRC522::PICC_Type)> callback)
@@ -108,6 +151,20 @@ void rcReader(std::function<void(MFRC522::Uid, MFRC522::PICC_Type)> callback)
   }
 }
 
+void resetDevice() {
+  printToDisplay("Resetting device");
+  prefs.begin("cred", false);
+  prefs.clear();
+  prefs.end();
+  prefs.begin("esp32", false);
+  prefs.clear();
+  prefs.end();
+  delay(1000);
+  printToDisplay("Restarting device");
+  delay(1000);
+  ESP.restart();
+}
+
 using namespace websockets;
 
 void onMessageCallback(WebsocketsMessage message) {
@@ -119,39 +176,75 @@ void onMessageCallback(WebsocketsMessage message) {
     return;
   }
 
+
   if (data.containsKey("command")) {
     const String command = data["command"];
     const String from = data["from"];
-    JsonDocument res;
+    const String topic = data["topic"];
+    const String to = data["to"];
+
+    prefs.begin("esp32", true);
+    if (to != prefs.getString("device_id")) {
+      prefs.end();
+      return;
+    }
+    prefs.end();
     
     if (command == "getDeviceInfo") {
       prefs.begin("esp32", true);
-      res["data"] = prefs.getString("device_info");
-      res["to"] = from;
-      res["from"] = ESP.getEfuseMac();
-      wsc.send(res.as<String>());
+      JsonDocument device_info;
+      device_info["device_id"] = prefs.getString("device_id");
+      device_info["device_type"] = prefs.getString("device_type");
+      device_info["device_name"] = prefs.getString("device_name");
+      wsc.send(makeResponse(
+        topic,
+        device_info, 
+        from
+      ).as<String>());
       prefs.end();
-      res.clear();
       return;
-    } 
+    }
+
+    if (command == "upgrade") {
+      prefs.begin("cred", false);
+      prefs.putString("path", data["data"].as<String>());
+      prefs.end();
+      wsc.send(makeResponse(
+        topic,
+        "upgrade to " + data["data"].as<String>(),
+        from
+      ).as<String>());
+      return;
+    }
+
+    if (command == "verify") {
+      prefs.begin("esp32", true);
+      wsc.send(makeResponse(
+        topic,
+        prefs.getString("device_id"),
+        from
+      ).as<String>());
+      prefs.end();
+    }
     
     if (command == "getEvents") {
-      prefs.begin("events", true);
-      res["data"] = prefs.getString("events");
-      res["to"] = from;
-      res["from"] = ESP.getEfuseMac();
-      wsc.send(res.as<String>());
+      prefs.begin("esp32", true);
+      JsonArray events;
+      wsc.send(makeResponse(
+        topic,
+        prefs.getString("events"),
+        from
+      ).as<String>());
       prefs.end();
-      res.clear();
       return;
     }
     
     if (command == "restart") {
-      res["data"] = "Restarting device in 3 seconds";
-      res["to"] = from;
-      res["from"] = ESP.getEfuseMac();
-      wsc.send(res.as<String>());
-      res.clear();
+      wsc.send(makeResponse(
+        topic,
+        "Restarting device in 3 seconds", 
+        from
+      ).as<String>());
 
       delay(3000);
 
@@ -161,12 +254,11 @@ void onMessageCallback(WebsocketsMessage message) {
     }
 
     if (command == "printToDisplay") {
-      printToDisplay(data["message"].as<String>());
-      res["data"] = "Message printed to display : " + data["message"].as<String>();
-      res["to"] = from;
-      res["from"] = ESP.getEfuseMac();
-      wsc.send(res.as<String>());
-      res.clear();
+      wsc.send(makeResponse(
+        topic,
+        "Message printed to display : " + data["data"].as<String>(),
+        from
+      ).as<String>());
       return;
     }
     return;
@@ -175,30 +267,125 @@ void onMessageCallback(WebsocketsMessage message) {
 
 void onWebSocketEventsCallback(WebsocketsEvent event, String data) {
     if(event == WebsocketsEvent::ConnectionOpened) {
-      prefs.begin("esp32", true);
-      wsc.send(prefs.getString("device_info"));
-      prefs.end();
       printToDisplay("Connected to WebSocket");
     } else if(event == WebsocketsEvent::ConnectionClosed) {
       printToDisplay("Disconnected from WebSocket");
     } else if(event == WebsocketsEvent::GotPing) {
-      Serial.println("Got a Ping!");
+      wsc.pong();
     } else if(event == WebsocketsEvent::GotPong) {
-      Serial.println("Got a Pong!");
+      wsc.ping();
     }
 }
 
 void onWifiEventsCallback(WiFiEvent_t event) {
+  int attempt_remaining = 10;
   switch (event) {
+    case WIFI_EVENT_STA_START:
+      printToDisplay("Connecting to WiFi ...");
+      break;
     case WIFI_EVENT_STA_CONNECTED:
       printToDisplay("Connected to WiFi");
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
-      printToDisplay("Disconnected from WiFi \n Reconnecting ...");
+      printToDisplay("Disconnected from WiFi");
       break;
     default:
       break;
   }
+}
+
+void data_init_once() {
+  prefs.begin("esp32", false);
+  if (!prefs.isKey("device_id")) {
+    Serial.println("Generate Metadata");
+    prefs.putString("device_id", String(ESP.getEfuseMac()));
+    prefs.putString("device_type", "ESP32");
+    prefs.putString("device_name", "RFID-ESP32");
+  }
+  prefs.putString("events", R"(
+  [
+    "restart-: args: none; description: restart the device",
+    "getDeviceInfo-: args: none; description: get device information",
+    "getEvents-: args: none; description: get available events",
+    "printToDisplay-: args: message(str); description: print message to display"
+  ]
+  )");
+  prefs.end();
+
+  prefs.begin("cred",false);
+  if (!prefs.isKey("ssid") && !prefs.isKey("server")) {
+    prefs.putBool("captive_portal", false);
+    Serial.println("ssid" + prefs.getString("ssid"));
+    Serial.println("server" + prefs.getString("server"));
+    prefs.end();
+    Serial.println("Credentials not found");
+  }
+}
+
+class CaptivePortalHandler : public AsyncWebHandler {
+public:
+  CaptivePortalHandler() {}
+  virtual ~CaptivePortalHandler() {}
+
+  bool canHandle(AsyncWebServerRequest *request){
+    return request->url() == "/";
+  }
+
+  void handleRequest(AsyncWebServerRequest *request) {
+    if (request->method() == HTTP_GET && request->url() == "/") {
+      request->send(200, "text/html", captivePortalPage);
+    } else {
+      request->send(200, "text/html", captivePortalPage);
+    }
+  }
+};
+
+class FormHandler : public AsyncWebHandler {
+public:
+  FormHandler() {}
+  virtual ~FormHandler() {}
+
+  bool canHandle(AsyncWebServerRequest *request){
+    return request->url() == "/save-config";
+  }
+
+  void handleRequest(AsyncWebServerRequest *request) {
+    if (request->url() == "/save-config") {
+
+      if (request->arg("key") != "DDN") {
+        request->send(200, "text/html", "Invalid key");
+        return;
+      };
+
+      prefs.begin("cred", false);
+      prefs.putBool("captive_portal", true);
+      prefs.putString("ssid", request->arg("ssid"));
+      prefs.putString("pass", request->arg("password"));
+      prefs.putString("server", request->arg("server"));
+      prefs.putInt("port", request->arg("port").toInt());
+      prefs.putString("path", request->arg("path"));
+      prefs.end();
+
+      request->send(200, "text/html", "Configuration saved. Restarting device ...");
+      ESP.restart();
+    } else {
+      request->send(200, "text/html", captivePortalPage);
+    }
+  }
+};
+
+void checkTouch(int pin) {
+    static uint32_t touchStart = 0;
+    if (touchRead(pin) < 40) { 
+        if (touchStart == 0) {
+            touchStart = millis();
+        } else if (millis() - touchStart >= 5000) {
+            resetDevice();
+            touchStart = 0;
+        }
+    } else {
+        touchStart = 0;
+    }
 }
 
 void setup() {
@@ -206,25 +393,8 @@ void setup() {
   SPI.begin();
   oledWire.begin(SDA_PIN, SCL_PIN);
 
-  prefs.begin("esp32", false);
-  if (prefs.getString("device_info").length() == 0) {
-    JsonDocument device_doc;
-    device_doc["device_id"] = ESP.getEfuseMac();
-    device_doc["device_type"] = "ESP32";
-    device_doc["device_name"] = "RFID-ESP32";
-    prefs.putString("device_info", device_doc.as<String>());
-  }
-  prefs.end();
-
-  // init functions can be called from websockets
-  prefs.begin("events", false);
-  JsonDocument events_doc;
-  events_doc["restart"] = "args: none; description: restart the device";
-  events_doc["getDeviceInfo"] = "args: none; description: get device information";
-  events_doc["getEvents"] = "args: none; description: get available events";
-  events_doc["printToDisplay"] = "args: message(str); description: print message to display";
-  prefs.putString("events", events_doc.as<String>());
-  prefs.end();
+  // init metadata device
+  data_init_once();
 
   // init Peripherals
   rfid.PCD_Init();
@@ -232,38 +402,66 @@ void setup() {
   pinMode(BUILTIN_LED, OUTPUT);
 
   // make loop until both peripherals are connected
-  while (!checkPeripherals()) {
-    Serial.println("Check peripherals ... ");
-    delay(1000);
+  while (!checkPeripherals()) delay(1000);
+
+  prefs.begin("cred", true);
+  if (!prefs.getBool("captive_portal")) {
+    prefs.end();
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("Card-Terminal");
+    printToDisplay("Setup Mode ON");
+  
+    wsr.addHandler(new CaptivePortalHandler()).setFilter(ON_AP_FILTER);
+    wsr.addHandler(new FormHandler()).setFilter(ON_AP_FILTER);
+    wsr.onNotFound([&](AsyncWebServerRequest *request){
+      request->send(200, "text/html", captivePortalPage); 
+    });
+
+    dnsServer.start(53, "*", WiFi.softAPIP());
+
+    wsr.begin();
+
+    while (true) {
+      dnsServer.processNextRequest();
+    }
   }
 
   // Connect to WiFi
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWifiEventsCallback);
-  while (WiFi.status() != WL_CONNECTED) {
-    printToDisplay("Connecting to WiFi...");
-    delay(1000);
-  }
+  WiFi.setAutoReconnect(true);
+  prefs.begin("cred", true);
+  WiFi.begin(prefs.getString("ssid"), prefs.getString("pass"));
+  prefs.end();
+  while (WiFi.status() != WL_CONNECTED) checkTouch(T0);
 
   // register WebSocket event handlers
   wsc.onMessage(onMessageCallback);
   wsc.onEvent(onWebSocketEventsCallback);
 
-  // connect to WebSocket server 
-  wsc.connect(WS_SERVER, WS_PORT, WS_PATH);
+  // connect to WebSocket server
+  prefs.begin("cred", false); 
+  wsc.connect(
+    prefs.getString("server"),
+    prefs.getInt("port"),
+    prefs.getString("path")
+  );
+  prefs.end();
 
-  wsc.ping();
-
-  printToDisplay("Ready");
 }
 
 void loop() {
-  rcReader(handleCardRead);
-  
+  checkTouch(T0);
+
   // check websocket connection and reconnect if necessary
-  if (!wsc.available() && !wsc.connect(WS_SERVER, WS_PORT, WS_PATH))
-    printToDisplay("websocket reconnecting");
-  else 
-    wsc.poll();
+  prefs.begin("websocket", false);
+  if (!wsc.available() && !wsc.connect(prefs.getString("server"),
+    prefs.getInt("port"),
+    prefs.getString("path"))) {
+    prefs.end();
+    delay(5000);
+    return;
+  }
+
+  rcReader(handleCardRead);
+  wsc.poll();
 }
