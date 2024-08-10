@@ -14,6 +14,10 @@
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 
+#include <esp_system.h>
+#include <nvs.h>
+#include <nvs_flash.h>
+
 // Define the pins for the rc522 RFID reader
 #define SS_PIN  5   // ESP32 DevKit V1 pin GPIO5
 #define RST_PIN 27  // ESP32 DevKit V1 pin GPIO27
@@ -90,6 +94,29 @@ JsonDocument makeResponse(String topic,JsonDocument data,String to,String from =
   return res;
 }
 
+
+void printESP32Status() {
+  // Memori heap yang tersedia (RAM)
+  Serial.println("=== Status Memori ===");
+  Serial.printf("Total RAM: %d bytes\n", ESP.getHeapSize());
+  Serial.printf("RAM yang tersedia: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("RAM terbesar yang tersedia: %d bytes\n", ESP.getMaxAllocHeap());
+
+  // Informasi Flash Storage
+  Serial.println("\n=== Status Flash Storage ===");
+  Serial.printf("Ukuran Flash: %d bytes\n", ESP.getFlashChipSize());
+  Serial.printf("Kecepatan Flash: %d Hz\n", ESP.getFlashChipSpeed());
+  Serial.printf("Model Flash: %s\n", ESP.getFlashChipMode() == FM_QIO ? "QIO" : "DIO");
+
+  // Status NVS (Non-Volatile Storage)
+  Serial.println("\n=== Status NVS ===");
+  nvs_stats_t nvs_stats;
+  nvs_get_stats(NULL, &nvs_stats);
+  Serial.printf("Jumlah namespace yang digunakan: %d\n", nvs_stats.namespace_count);
+  Serial.printf("Jumlah key-value pairs yang digunakan: %d\n", nvs_stats.used_entries);
+  Serial.printf("Jumlah key-value pairs yang tersisa: %d\n", nvs_stats.free_entries);
+}
+
 bool checkPeripherals()
 {
   bool oledConnected = false;
@@ -152,16 +179,35 @@ void rcReader(std::function<void(MFRC522::Uid, MFRC522::PICC_Type)> callback)
 }
 
 void resetDevice() {
+   // Menampilkan pesan bahwa perangkat akan di-reset
   printToDisplay("Resetting device");
-  prefs.begin("cred", false);
-  prefs.clear();
-  prefs.end();
-  prefs.begin("esp32", false);
-  prefs.clear();
-  prefs.end();
+  
+  // reset namespace esp32
+  if (prefs.begin("esp32", false)) {
+    prefs.clear();
+    prefs.end();
+  } else {
+    Serial.println("Failed to reset esp32 namespace");
+  }
+
+  // reset namespace cred
+  if (prefs.begin("cred", false)) {
+    prefs.clear();
+    prefs.end();
+  } else {
+    Serial.println("Failed to reset cred namespace");
+  }
+
+  // Tunda sejenak sebelum merestart perangkat
   delay(1000);
+
+  // Menampilkan pesan bahwa perangkat akan di-restart
   printToDisplay("Restarting device");
+  
+  // Tunda sejenak untuk menampilkan pesan
   delay(1000);
+
+  // Restart ESP32
   ESP.restart();
 }
 
@@ -296,7 +342,8 @@ void onWifiEventsCallback(WiFiEvent_t event) {
 
 void data_init_once() {
   prefs.begin("esp32", false);
-  if (!prefs.isKey("device_id")) {
+  
+  if (prefs.getString("device_id") == emptyString) {
     Serial.println("Generate Metadata");
     prefs.putString("device_id", String(ESP.getEfuseMac()));
     prefs.putString("device_type", "ESP32");
@@ -313,7 +360,7 @@ void data_init_once() {
   prefs.end();
 
   prefs.begin("cred",false);
-  if (!prefs.isKey("ssid") && !prefs.isKey("server")) {
+  if (prefs.getString("ssid") == emptyString || prefs.getString("server") == emptyString) {
     prefs.putBool("captive_portal", false);
     Serial.println("ssid" + prefs.getString("ssid"));
     Serial.println("server" + prefs.getString("server"));
@@ -388,6 +435,15 @@ void checkTouch(int pin) {
     }
 }
 
+// WebSocket server configuration
+String WS_SERVER;
+int WS_PORT;
+String WS_PATH;
+
+// WiFi configuration
+String WIFI_SSID;
+String WIFI_PASSWORD;
+
 void setup() {
   Serial.begin(115200);
   SPI.begin();
@@ -395,6 +451,8 @@ void setup() {
 
   // init metadata device
   data_init_once();
+
+  printESP32Status();
 
   // init Peripherals
   rfid.PCD_Init();
@@ -426,12 +484,19 @@ void setup() {
     }
   }
 
+  // Load WiFi and WebSocket configuration
+  prefs.begin("cred", false);
+  WIFI_SSID = prefs.getString("ssid");
+  WIFI_PASSWORD = prefs.getString("pass");
+  WS_SERVER = prefs.getString("server");
+  WS_PORT = prefs.getInt("port");
+  WS_PATH = prefs.getString("path");
+  prefs.end();
+
   // Connect to WiFi
   WiFi.onEvent(onWifiEventsCallback);
   WiFi.setAutoReconnect(true);
-  prefs.begin("cred", true);
-  WiFi.begin(prefs.getString("ssid"), prefs.getString("pass"));
-  prefs.end();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) checkTouch(T0);
 
   // register WebSocket event handlers
@@ -439,13 +504,11 @@ void setup() {
   wsc.onEvent(onWebSocketEventsCallback);
 
   // connect to WebSocket server
-  prefs.begin("cred", false); 
   wsc.connect(
-    prefs.getString("server"),
-    prefs.getInt("port"),
-    prefs.getString("path")
+    WS_SERVER,
+    WS_PORT,
+    WS_PATH
   );
-  prefs.end();
 
 }
 
@@ -453,11 +516,7 @@ void loop() {
   checkTouch(T0);
 
   // check websocket connection and reconnect if necessary
-  prefs.begin("websocket", false);
-  if (!wsc.available() && !wsc.connect(prefs.getString("server"),
-    prefs.getInt("port"),
-    prefs.getString("path"))) {
-    prefs.end();
+  if (!wsc.available() && !wsc.connect(WS_SERVER, WS_PORT, WS_PATH)) {
     delay(5000);
     return;
   }
